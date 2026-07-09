@@ -10,17 +10,59 @@ use bytes::Bytes;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use super::{digest_to_proto, proto_to_digest};
+use super::{digest_to_proto, proto_to_digest, validate_instance_name};
+
+/// Per-request bounds for the CAS batch RPCs, enforced at the service boundary
+/// so a malicious or buggy client cannot exhaust control-plane memory with a
+/// single oversized request (issue #66).
+#[derive(Debug, Clone, Copy)]
+pub struct BatchLimits {
+    /// Maximum number of blobs in one `FindMissingBlobs`, `BatchReadBlobs`,
+    /// or `BatchUpdateBlobs` request.
+    pub max_blobs_per_request: usize,
+    /// Maximum total payload bytes in one `BatchUpdateBlobs` request.
+    pub max_request_bytes: usize,
+}
+
+impl Default for BatchLimits {
+    fn default() -> Self {
+        // `max_request_bytes` mirrors the `max_batch_total_size_bytes` the
+        // `Capabilities` service advertises (4 MiB), so the server enforces
+        // exactly the bound it tells clients to respect.
+        Self {
+            max_blobs_per_request: 1000,
+            max_request_bytes: 4 * 1024 * 1024,
+        }
+    }
+}
 
 /// REAPI `ContentAddressableStorage` service backed by a [`Cas`].
 pub struct CasService<C: Cas> {
     backend: Arc<C>,
+    limits: BatchLimits,
 }
 
 impl<C: Cas> CasService<C> {
-    /// Wrap a CAS backend into a tonic service.
+    /// Wrap a CAS backend into a tonic service with default [`BatchLimits`].
     pub fn new(backend: Arc<C>) -> Self {
-        Self { backend }
+        Self::with_limits(backend, BatchLimits::default())
+    }
+
+    /// Wrap a CAS backend with explicit per-request [`BatchLimits`].
+    pub fn with_limits(backend: Arc<C>, limits: BatchLimits) -> Self {
+        Self { backend, limits }
+    }
+
+    /// Reject a batch whose blob count exceeds
+    /// [`BatchLimits::max_blobs_per_request`].
+    fn check_blob_count(&self, count: usize) -> Result<(), Status> {
+        if count > self.limits.max_blobs_per_request {
+            return Err(Status::invalid_argument(format!(
+                "batch has {count} blobs, exceeding the per-request limit of {}",
+                self.limits.max_blobs_per_request
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -32,6 +74,8 @@ impl<C: Cas> CasSvc for CasService<C> {
     ) -> Result<Response<rapi::FindMissingBlobsResponse>, Status> {
         let span = tracing::info_span!("cas::find_missing_blobs");
         let req = request.into_inner();
+        validate_instance_name(&req.instance_name)?;
+        self.check_blob_count(req.blob_digests.len())?;
         let digests: Vec<super::Digest> = req
             .blob_digests
             .iter()
@@ -55,42 +99,84 @@ impl<C: Cas> CasSvc for CasService<C> {
     ) -> Result<Response<rapi::BatchUpdateBlobsResponse>, Status> {
         let span = tracing::info_span!("cas::batch_update_blobs");
         let req = request.into_inner();
+        validate_instance_name(&req.instance_name)?;
         let request_count = req.requests.len();
+        self.check_blob_count(request_count)?;
+        let total_bytes: usize = req.requests.iter().map(|r| r.data.len()).sum();
+        if total_bytes > self.limits.max_request_bytes {
+            return Err(Status::invalid_argument(format!(
+                "batch payload is {total_bytes} bytes, exceeding the per-request limit of {}",
+                self.limits.max_request_bytes
+            )));
+        }
+
+        // Verify each entry's declared digest against its bytes *before*
+        // we hand the batch to the backend. The backend re-verifies (issue
+        // #70 defence-in-depth), but rejecting at the service boundary
+        // avoids a spawn_blocking redb txn for known-bad entries and gives
+        // the client per-entry feedback in the REAPI-required shape.
+        let mut responses: Vec<rapi::batch_update_blobs_response::Response> =
+            Vec::with_capacity(request_count);
         let mut blobs: Vec<(super::Digest, Bytes)> = Vec::with_capacity(request_count);
+        let mut accepted_indices: Vec<usize> = Vec::with_capacity(request_count);
         for r in req.requests {
             let d = r
                 .digest
                 .as_ref()
                 .ok_or_else(|| Status::invalid_argument("missing digest"))?;
             let digest = proto_to_digest(d)?;
-            blobs.push((digest, Bytes::from(r.data)));
+            let data = Bytes::from(r.data);
+            match digest.verify(data.as_ref()) {
+                Ok(()) => {
+                    accepted_indices.push(responses.len());
+                    responses.push(rapi::batch_update_blobs_response::Response {
+                        digest: Some(digest_to_proto(&digest)),
+                        // Placeholder; replaced after backend write succeeds.
+                        status: None,
+                    });
+                    blobs.push((digest, data));
+                }
+                Err(e) => {
+                    responses.push(rapi::batch_update_blobs_response::Response {
+                        digest: Some(digest_to_proto(&digest)),
+                        status: Some(brokkr_proto::rpc::Status {
+                            // INVALID_ARGUMENT
+                            code: 3,
+                            message: format!("digest verification failed: {e}"),
+                            details: vec![],
+                        }),
+                    });
+                }
+            }
         }
+
         let results = self
             .backend
             .batch_update_blobs(blobs)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         let _enter = span.enter();
-        tracing::info!(request_count);
-        let responses = results
-            .into_iter()
-            .map(|u| rapi::batch_update_blobs_response::Response {
-                digest: Some(digest_to_proto(&u.digest)),
-                status: Some(match u.status {
-                    Ok(()) => brokkr_proto::rpc::Status {
-                        code: 0,
-                        message: String::new(),
-                        details: vec![],
-                    },
-                    Err(msg) => brokkr_proto::rpc::Status {
-                        // INVALID_ARGUMENT
-                        code: 3,
-                        message: msg,
-                        details: vec![],
-                    },
-                }),
-            })
-            .collect();
+        tracing::info!(
+            request_count,
+            accepted = accepted_indices.len(),
+            rejected = request_count - accepted_indices.len(),
+        );
+        for (idx, u) in accepted_indices.into_iter().zip(results) {
+            responses[idx].status = Some(match u.status {
+                Ok(()) => brokkr_proto::rpc::Status {
+                    code: 0,
+                    message: String::new(),
+                    details: vec![],
+                },
+                Err(msg) => brokkr_proto::rpc::Status {
+                    // INVALID_ARGUMENT — backend re-verification failed
+                    // (size limit, partial write, etc.).
+                    code: 3,
+                    message: msg,
+                    details: vec![],
+                },
+            });
+        }
         Ok(Response::new(rapi::BatchUpdateBlobsResponse { responses }))
     }
 
@@ -100,7 +186,9 @@ impl<C: Cas> CasSvc for CasService<C> {
     ) -> Result<Response<rapi::BatchReadBlobsResponse>, Status> {
         let span = tracing::info_span!("cas::batch_read_blobs");
         let req = request.into_inner();
+        validate_instance_name(&req.instance_name)?;
         let digest_count = req.digests.len();
+        self.check_blob_count(digest_count)?;
         let digests: Vec<super::Digest> = req
             .digests
             .iter()
@@ -167,5 +255,71 @@ impl<C: Cas> CasSvc for CasService<C> {
         Err(Status::unimplemented(
             "SpliceBlob not implemented in Phase 1",
         ))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::disallowed_methods, clippy::panic)]
+mod tests {
+    use std::sync::Arc;
+
+    use brokkr_cas::InMemoryCas;
+    use brokkr_proto::reapi_v2 as rapi;
+    use rapi::content_addressable_storage_server::ContentAddressableStorage as _;
+    use tonic::{Code, Request};
+
+    use super::CasService;
+
+    fn service() -> CasService<InMemoryCas> {
+        CasService::new(Arc::new(InMemoryCas::new()))
+    }
+
+    #[tokio::test]
+    async fn find_missing_blobs_rejects_named_instance() {
+        let req = rapi::FindMissingBlobsRequest {
+            instance_name: "tenant-a".to_string(),
+            ..Default::default()
+        };
+        let err = service()
+            .find_missing_blobs(Request::new(req))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn find_missing_blobs_accepts_default_instance() {
+        // Empty instance_name is the single Phase-1 instance — must succeed.
+        let resp = service()
+            .find_missing_blobs(Request::new(rapi::FindMissingBlobsRequest::default()))
+            .await
+            .unwrap();
+        assert!(resp.into_inner().missing_blob_digests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_read_blobs_rejects_named_instance() {
+        let req = rapi::BatchReadBlobsRequest {
+            instance_name: "tenant-a".to_string(),
+            ..Default::default()
+        };
+        let err = service()
+            .batch_read_blobs(Request::new(req))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn batch_update_blobs_rejects_named_instance() {
+        let req = rapi::BatchUpdateBlobsRequest {
+            instance_name: "tenant-a".to_string(),
+            ..Default::default()
+        };
+        let err = service()
+            .batch_update_blobs(Request::new(req))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
     }
 }

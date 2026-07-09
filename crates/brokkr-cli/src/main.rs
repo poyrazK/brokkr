@@ -3,8 +3,10 @@
 //! Phase 1: `version`, stub `init`, and `run --command "..."` for the
 //! end-to-end happy path.
 
+use std::path::PathBuf;
+
 use anyhow::{anyhow, Context, Result};
-use brokkr_sdk::{run_command, BrokkrClient};
+use brokkr_sdk::{run_command, BrokkrClient, TlsConfig};
 use clap::{Parser, Subcommand};
 
 /// Top-level CLI entrypoint.
@@ -41,6 +43,33 @@ enum Command {
         #[arg(long)]
         no_cache: bool,
 
+        /// CA certificate for verifying the control plane server certificate.
+        #[arg(long)]
+        tls_ca: Option<String>,
+
+        /// Client certificate for mTLS authentication (requires --tls-client-key).
+        #[arg(long, requires = "tls_client_key")]
+        tls_client_cert: Option<String>,
+
+        /// Client private key for mTLS authentication (requires --tls-client-cert).
+        #[arg(long, requires = "tls_client_cert")]
+        tls_client_key: Option<String>,
+
+        /// JWT bearer token sent in `authorization: Bearer <token>` on
+        /// every outbound RPC. Required when the control plane has
+        /// `--auth-jwt-*` enabled (ADR 0011, issue #139). Mutually
+        /// exclusive with `--bearer-token-file`.
+        #[arg(long, conflicts_with = "bearer_token_file")]
+        bearer_token: Option<String>,
+
+        /// Path to a file containing the JWT bearer token. Preferred
+        /// for tokens read from disk so they don't appear in `ps` or
+        /// `/proc/<pid>/cmdline`. Mutually exclusive with
+        /// `--bearer-token`. The file should contain the raw token
+        /// bytes; trailing whitespace is trimmed.
+        #[arg(long, conflicts_with = "bearer_token")]
+        bearer_token_file: Option<PathBuf>,
+
         /// The command to run, including arguments. Pass via repeated
         /// positional args: `brokk run -- echo hello world`.
         #[arg(trailing_var_arg = true, required = true)]
@@ -63,8 +92,26 @@ fn main() -> Result<()> {
         Command::Run {
             control,
             no_cache,
+            tls_ca,
+            tls_client_cert,
+            tls_client_key,
+            bearer_token,
+            bearer_token_file,
             argv,
-        } => run_subcmd(control, no_cache, argv),
+        } => run_subcmd(RunOptions {
+            control,
+            no_cache,
+            tls: TlsOptions {
+                ca: tls_ca,
+                client_cert: tls_client_cert,
+                client_key: tls_client_key,
+            },
+            bearer: BearerOptions {
+                token: bearer_token,
+                token_file: bearer_token_file,
+            },
+            argv,
+        }),
     }
 }
 
@@ -151,13 +198,90 @@ pub fn init_project(force: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_subcmd(control: String, no_cache: bool, argv: Vec<String>) -> Result<()> {
-    if argv.is_empty() {
+/// TLS-related CLI options for `brokk run`. Bundled to keep the
+/// `run_subcmd` signature below clippy's `too_many_arguments` threshold.
+#[derive(Debug, Default)]
+struct TlsOptions {
+    ca: Option<String>,
+    client_cert: Option<String>,
+    client_key: Option<String>,
+}
+
+/// Bearer-token CLI options for `brokk run`. Mutually exclusive at the
+/// clap layer (`conflicts_with`); we materialise one of three states
+/// (`Token`, `TokenFile`, `None`) into the resolved token in
+/// `run_subcmd`.
+#[derive(Debug, Default)]
+struct BearerOptions {
+    token: Option<String>,
+    token_file: Option<PathBuf>,
+}
+
+/// Everything `run_subcmd` needs from the CLI layer. Bundled for the
+/// same reason as [`TlsOptions`] and [`BearerOptions`].
+struct RunOptions {
+    control: String,
+    no_cache: bool,
+    tls: TlsOptions,
+    bearer: BearerOptions,
+    argv: Vec<String>,
+}
+
+fn run_subcmd(opts: RunOptions) -> Result<()> {
+    if opts.argv.is_empty() {
         return Err(anyhow!("`brokk run` requires a command"));
     }
+
+    // Runtime validation: partial mTLS identity is an error.
+    let has_cert = opts.tls.client_cert.is_some();
+    let has_key = opts.tls.client_key.is_some();
+    if has_cert != has_key {
+        anyhow::bail!("both --tls-client-cert and --tls-client-key must be provided together");
+    }
+    if (has_cert || has_key) && opts.tls.ca.is_none() {
+        anyhow::bail!("--tls-client-cert and --tls-client-key require --tls-ca to be provided");
+    }
+
+    // Resolve bearer token: `--bearer-token` wins if both are somehow set,
+    // but `conflicts_with` on the clap args should already prevent that.
+    let bearer = match (opts.bearer.token, opts.bearer.token_file) {
+        (Some(t), _) => Some(t),
+        (None, Some(path)) => Some(
+            std::fs::read_to_string(&path)
+                .with_context(|| format!("reading bearer token from {}", path.display()))?
+                .trim()
+                .to_string(),
+        ),
+        (None, None) => None,
+    };
+
+    let tls = opts.tls.ca.map(|ca| TlsConfig {
+        ca_cert: std::path::PathBuf::from(ca),
+        client_cert: opts.tls.client_cert.map(std::path::PathBuf::from),
+        client_key: opts.tls.client_key.map(std::path::PathBuf::from),
+    });
+
+    let control = opts.control;
+    let argv = opts.argv;
+    let no_cache = opts.no_cache;
+
     let rt = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
-    rt.block_on(async {
-        let mut client = BrokkrClient::connect(control).await?;
+    rt.block_on(async move {
+        // Connect with the right combination: TLS, bearer, or both.
+        // The `(tls, bearer)` matrix is exhaustive: 0..=1 of each may be
+        // set; we materialise it into four branches to keep the call
+        // sites readable. The control plane refuses to start in any
+        // combination that would silently mis-configure auth (issue
+        // #139), so a wrong client-side combo just surfaces as a
+        // runtime `UNAUTHENTICATED` here.
+        let mut client = match (tls, bearer) {
+            (Some(tls_cfg), Some(token)) => {
+                BrokkrClient::connect_with_tls_and_bearer(control, tls_cfg, token).await?
+            }
+            (Some(tls_cfg), None) => BrokkrClient::connect_with_tls(control, tls_cfg).await?,
+            (None, Some(token)) => BrokkrClient::connect_with_bearer(control, token).await?,
+            (None, None) => BrokkrClient::connect(control).await?,
+        };
         let outcome = run_command(&mut client, &argv, no_cache).await?;
         // Forward stdout/stderr verbatim to the user's terminal.
         use std::io::Write as _;

@@ -1,0 +1,143 @@
+// Brokkr internal Raft consensus protocol (Phase 5, ADR 0013).
+//
+// The from-scratch Raft implementation in `brokkr-raft` uses this service for
+// all peer-to-peer traffic. Three RPCs, straight from the Raft paper (Figure 2)
+// plus the snapshot RPC from §7; see `docs/raft-notes.md`. This is an internal
+// surface — clients never speak it; they reach the control plane over REAPI and
+// are redirected to the leader (I8).
+syntax = "proto3";
+
+package brokkr.v1;
+
+// A single entry in the replicated log.
+//
+// `command` is opaque to Raft — the state machine interprets it. Stored on disk
+// protobuf-encoded (ADR 0013 D1), so a leader replicates the stored bytes over
+// `AppendEntries` without re-encoding.
+message LogEntry {
+  // Leader's term when the entry was created.
+  uint64 term = 1;
+  // 1-based position in the log.
+  uint64 index = 2;
+  // Opaque state-machine command (meaningful when `kind` is COMMAND).
+  bytes command = 3;
+  // Entry discriminator (I7). COMMAND is the proto3 default, so entries
+  // written before this field existed keep decoding as commands.
+  EntryKind kind = 4;
+  // The cluster configuration, present iff `kind` is CONFIG.
+  ClusterConfig config = 5;
+}
+
+// The kind of a log entry (I7, membership changes).
+enum EntryKind {
+  // `command` holds an opaque state-machine command (the default).
+  ENTRY_KIND_COMMAND = 0;
+  // A leader's start-of-term no-op (reserved for the linearizable-read path).
+  ENTRY_KIND_NOOP = 1;
+  // `config` holds a cluster membership configuration.
+  ENTRY_KIND_CONFIG = 2;
+}
+
+// A cluster membership configuration (I7, joint consensus — Raft §6 /
+// thesis ch. 4). Configurations travel *in the log itself*: appending a
+// CONFIG entry is what changes the membership a node uses.
+message ClusterConfig {
+  // Voting members (during a joint change these are C_new's voters).
+  repeated string voters = 1;
+  // C_old's voters while the joint configuration C_old,new is in flight;
+  // empty otherwise. When non-empty, agreement requires a majority of BOTH
+  // `voters` and `old_voters`.
+  repeated string old_voters = 2;
+  // Non-voting members being caught up before promotion (thesis ch. 4).
+  // Replicated to, never counted toward quorum.
+  repeated string learners = 3;
+}
+
+// RequestVote (Raft §5.2). Sent by a candidate to gather votes.
+message RequestVoteRequest {
+  // Candidate's term.
+  uint64 term = 1;
+  // Candidate requesting the vote.
+  string candidate_id = 2;
+  // Index of the candidate's last log entry (0 if empty).
+  uint64 last_log_index = 3;
+  // Term of the candidate's last log entry (0 if empty).
+  uint64 last_log_term = 4;
+}
+
+message RequestVoteReply {
+  // Voter's current term, for the candidate to update itself.
+  uint64 term = 1;
+  // True iff the vote was granted.
+  bool vote_granted = 2;
+}
+
+// AppendEntries (Raft §5.3). Sent by the leader to replicate entries and as an
+// empty heartbeat.
+message AppendEntriesRequest {
+  // Leader's term.
+  uint64 term = 1;
+  // So a follower can redirect clients.
+  string leader_id = 2;
+  // Index of the log entry immediately preceding the new ones.
+  uint64 prev_log_index = 3;
+  // Term of `prev_log_index`.
+  uint64 prev_log_term = 4;
+  // Entries to store (empty for heartbeat).
+  repeated LogEntry entries = 5;
+  // Leader's commitIndex.
+  uint64 leader_commit = 6;
+}
+
+message AppendEntriesReply {
+  // Follower's current term, for the leader to update itself.
+  uint64 term = 1;
+  // True iff the follower's log matched at prev_log_index/prev_log_term.
+  bool success = 2;
+  // Conflict-fast-backtrack hint (raft-notes §5.3 optimization): the term of the
+  // conflicting entry, and the first index the follower stores for that term.
+  // Zero when there was no term conflict. Lets the leader skip a whole term per
+  // round trip instead of decrementing nextIndex by one.
+  uint64 conflict_term = 3;
+  uint64 conflict_index = 4;
+  // On success, the highest log index the follower now has that is guaranteed to
+  // match the leader (prev_log_index + len(entries)). The leader sets
+  // matchIndex[follower] to this. Zero on failure.
+  uint64 match_index = 5;
+}
+
+// InstallSnapshot (Raft §7). Sent by the leader to a follower that has fallen so
+// far behind that the leader has already discarded the next entry it needs.
+message InstallSnapshotRequest {
+  // Leader's term.
+  uint64 term = 1;
+  // So a follower can redirect clients.
+  string leader_id = 2;
+  // The snapshot replaces all entries up through this index.
+  uint64 last_included_index = 3;
+  // Term of `last_included_index`.
+  uint64 last_included_term = 4;
+  // Byte offset where this chunk is positioned in the snapshot file.
+  uint64 offset = 5;
+  // Raw snapshot chunk, starting at `offset`.
+  bytes data = 6;
+  // True if this is the last chunk.
+  bool done = 7;
+  // The cluster configuration in effect at `last_included_index` (I7b) —
+  // snapshots replace config entries too, so the receiver must learn the
+  // membership from here.
+  ClusterConfig config = 8;
+}
+
+message InstallSnapshotReply {
+  // Follower's current term, for the leader to update itself.
+  uint64 term = 1;
+}
+
+// Peer-to-peer Raft RPCs. Every reply carries the responder's term so a stale
+// sender steps down (raft-notes §2.2).
+service RaftService {
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteReply);
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesReply);
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotReply);
+}

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/brokkr-common",
     "crates/brokkr-proto",
+    "crates/brokkr-raft",
     "crates/brokkr-cas",
     "crates/brokkr-control",
     "crates/brokkr-worker",
@@ -28,10 +29,14 @@ futures = "0.3"
 async-trait = "0.1"
 
 # RPC / proto
-tonic = "0.12"
+tonic = { version = "0.12", features = ["tls"] }
 tonic-build = "0.12"
 prost = "0.13"
 prost-types = "0.13"
+# tonic-over-turmoil test glue (dev-only; Phase 5 I5c). Versions match tonic
+# 0.12's hyper 1.0 stack.
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.4", features = ["util"] }
 
 # Serialization
 bytes = "1"
@@ -42,13 +47,20 @@ bincode = "1"
 # Storage
 redb = "2"
 
+# Deterministic network simulation (Phase 5 Raft testing; plan §7/§21)
+turmoil = "0.6"
+
 # Hashing
 sha2 = "0.10"
 hex = "0.4"
 
 # Errors
-thiserror = "1"
+thiserror = "2"
 anyhow = "1"
+
+# Auth (ADR 0011) — JWT bearer validation; no network I/O. Crypto backend
+# (`ring`) is already in-tree via rustls/tonic TLS.
+jsonwebtoken = "9"
 
 # IDs
 uuid = { version = "1", features = ["v4"] }
@@ -68,9 +80,14 @@ tempfile = "3"
 # Linux primitives (sandbox)
 nix = { version = "0.29", default-features = false, features = ["fs", "hostname", "mount", "process", "sched", "signal", "user"] }
 
+# FUSE input materialisation (M6b, worker only, Linux only at runtime)
+fuser = "0.17"
+memmap2 = "0.9"
+
 # Internal crates
 brokkr-common = { path = "crates/brokkr-common", version = "0.1.0" }
 brokkr-proto = { path = "crates/brokkr-proto", version = "0.1.0" }
+brokkr-raft = { path = "crates/brokkr-raft", version = "0.1.0" }
 brokkr-cas = { path = "crates/brokkr-cas", version = "0.1.0" }
 brokkr-control = { path = "crates/brokkr-control", version = "0.1.0" }
 brokkr-worker = { path = "crates/brokkr-worker", version = "0.1.0" }
@@ -80,11 +97,23 @@ brokkr-test-utils = { path = "crates/brokkr-test-utils", version = "0.1.0" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+# Idiomatic-Rust and hygiene gates. CI runs with `-D warnings`, so each of
+# these is effectively an error there; they are `warn` so a plain local
+# `cargo build` still succeeds while surfacing them. `rust_2018_idioms` is a
+# lint *group*, so it takes a lower priority than the individual lints (Cargo
+# requires this so a group can be overridden per-lint).
+# TODO(brokkr): also enable `unused_qualifications` and `unreachable_pub` once
+# the ~44 pre-existing violations they surface (mostly in brokkr-sandbox and
+# brokkr-control) are cleaned up in a dedicated follow-up.
+rust_2018_idioms = { level = "warn", priority = -1 }
+unused_lifetimes = "warn"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
+# A stray `dbg!` must never reach a commit.
+dbg_macro = "deny"
 
 [profile.release]
 lto = "thin"

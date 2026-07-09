@@ -4,12 +4,8 @@
 //! - **EV-02** action calls `mount(2)` directly → EPERM (seccomp).
 //! - **EV-03** action calls `keyctl(2)` directly → EPERM (seccomp).
 //! - **EV-04** action calls `ptrace(PTRACE_TRACEME)` → EPERM (seccomp).
-//! - **EV-09** RDTSC. The plan ("SIGSYS or EPERM, CPU dependent") notes
-//!   this requires a kernel/CPU willing to honour `PR_SET_TSC`. seccomp
-//!   does not gate userland-only instructions like `rdtsc`, so this case
-//!   is `#[ignore]`d on M7 — we'd need argument-level `prctl` filtering
-//!   (TODO marked in `runner/seccomp.rs`) plus `PR_SET_TSC=PR_TSC_SIGSEGV`
-//!   to make it deterministic.
+//! - **EV-09** RDTSC. The runner calls `prctl(PR_SET_TSC, PR_TSC_SIGSEGV)`
+//!   before exec so any `rdtsc`/`rdtscp` instruction raises SIGSEGV.
 //! - **EV-10** the runner sets `PR_SET_NO_NEW_PRIVS`. We assert this via
 //!   `prctl(PR_GET_NO_NEW_PRIVS)`, which should return 1 inside the
 //!   sandboxed process.
@@ -183,15 +179,271 @@ async fn ev04_ptrace_blocked_by_seccomp() {
     );
 }
 
-/// EV-09 — RDTSC. seccomp doesn't gate userland-only instructions, so
-/// reaching SIGSYS / EPERM here requires `prctl(PR_SET_TSC,
-/// PR_TSC_SIGSEGV)` plus a CPU+kernel that honours it. Argument-level
-/// `prctl` filtering is on the M7+ TODO list. Marking ignored.
+/// EV-09 — PR_SET_TSC blocked by seccomp argument filter.
+/// On x86_64 the filter blocks prctl(PR_SET_TSC, PR_TSC_SIGSEGV) with EPERM.
 #[cfg(target_arch = "x86_64")]
 #[tokio::test]
-#[ignore = "TODO(M7+): EV-09 needs prctl(PR_SET_TSC) wiring; seccomp can't gate rdtsc on its own"]
+async fn ev09_prctl_set_tsc_blocked() {
+    skip_if_unsupported!();
+    let sandbox = Sandbox::new(runner_path());
+    // PR_SET_TSC = 10, PR_TSC_SIGSEGV = 1
+    let script = "import ctypes, sys\n\
+         libc = ctypes.CDLL('libc.so.6', use_errno=True)\n\
+         rc = libc.prctl(10, 1, 0, 0, 0)\n\
+         if rc == -1:\n\
+         \x20   sys.exit(ctypes.get_errno())\n\
+         sys.exit(1)\n"; // exit 1 if it didn't error (unexpectedly succeeded)
+    let cfg = SandboxConfig {
+        argv: vec!["/usr/bin/python3".into(), "-c".into(), script.into()],
+        rootfs: minimal_linux_rootfs(),
+        workdir: Some(PathBuf::from("/work")),
+        ..Default::default()
+    };
+    let outcome = sandbox.run(cfg).await.unwrap();
+    assert_eq!(
+        outcome.exit_status,
+        ExitStatus::Exited(EPERM),
+        "prctl(PR_SET_TSC) should EPERM under seccomp; stderr={}",
+        String::from_utf8_lossy(&outcome.stderr)
+    );
+}
+
+/// EV — PR_SET_KEEPCAPS blocked by seccomp argument filter.
+#[tokio::test]
+async fn ev_prctl_keepcaps_blocked() {
+    skip_if_unsupported!();
+    let sandbox = Sandbox::new(runner_path());
+    // PR_SET_KEEPCAPS = 31
+    let script = "import ctypes, sys\n\
+         libc = ctypes.CDLL('libc.so.6', use_errno=True)\n\
+         rc = libc.prctl(31, 1, 0, 0, 0)\n\
+         if rc == -1:\n\
+         \x20   sys.exit(ctypes.get_errno())\n\
+         sys.exit(1)\n";
+    let cfg = SandboxConfig {
+        argv: vec!["/usr/bin/python3".into(), "-c".into(), script.into()],
+        rootfs: minimal_linux_rootfs(),
+        workdir: Some(PathBuf::from("/work")),
+        ..Default::default()
+    };
+    let outcome = sandbox.run(cfg).await.unwrap();
+    assert_eq!(
+        outcome.exit_status,
+        ExitStatus::Exited(EPERM),
+        "prctl(PR_SET_KEEPCAPS) should EPERM under seccomp; stderr={}",
+        String::from_utf8_lossy(&outcome.stderr)
+    );
+}
+
+/// EV — PR_CAPBSET_DROP blocked by seccomp argument filter.
+#[tokio::test]
+async fn ev_prctl_capbset_drop_blocked() {
+    skip_if_unsupported!();
+    let sandbox = Sandbox::new(runner_path());
+    // PR_CAPBSET_DROP = 36
+    let script = "import ctypes, sys\n\
+         libc = ctypes.CDLL('libc.so.6', use_errno=True)\n\
+         rc = libc.prctl(36, 0, 0, 0, 0)\n\
+         if rc == -1:\n\
+         \x20   sys.exit(ctypes.get_errno())\n\
+         sys.exit(1)\n";
+    let cfg = SandboxConfig {
+        argv: vec!["/usr/bin/python3".into(), "-c".into(), script.into()],
+        rootfs: minimal_linux_rootfs(),
+        workdir: Some(PathBuf::from("/work")),
+        ..Default::default()
+    };
+    let outcome = sandbox.run(cfg).await.unwrap();
+    assert_eq!(
+        outcome.exit_status,
+        ExitStatus::Exited(EPERM),
+        "prctl(PR_CAPBSET_DROP) should EPERM under seccomp; stderr={}",
+        String::from_utf8_lossy(&outcome.stderr)
+    );
+}
+
+/// EV — PR_GET_TSC blocked by seccomp argument filter.
+#[cfg(target_arch = "x86_64")]
+#[tokio::test]
+async fn ev_prctl_get_tsc_blocked() {
+    skip_if_unsupported!();
+    let sandbox = Sandbox::new(runner_path());
+    // PR_GET_TSC = 11 — read-only query but blocked to prevent info leak
+    let script = "import ctypes, sys\n\
+         libc = ctypes.CDLL('libc.so.6', use_errno=True)\n\
+         rc = libc.prctl(11, 0, 0, 0, 0)\n\
+         if rc == -1:\n\
+         \x20   sys.exit(ctypes.get_errno())\n\
+         sys.exit(1)\n";
+    let cfg = SandboxConfig {
+        argv: vec!["/usr/bin/python3".into(), "-c".into(), script.into()],
+        rootfs: minimal_linux_rootfs(),
+        workdir: Some(PathBuf::from("/work")),
+        ..Default::default()
+    };
+    let outcome = sandbox.run(cfg).await.unwrap();
+    assert_eq!(
+        outcome.exit_status,
+        ExitStatus::Exited(EPERM),
+        "prctl(PR_GET_TSC) should EPERM under seccomp; stderr={}",
+        String::from_utf8_lossy(&outcome.stderr)
+    );
+}
+
+/// EV — ioctl(TIOCGWINSZ) blocked by seccomp argument filter.
+#[tokio::test]
+async fn ev_ioctl_tiocgwinsz_blocked() {
+    skip_if_unsupported!();
+    let sandbox = Sandbox::new(runner_path());
+    // TIOCGWINSZ = 0x5413 — read terminal window size (info leak)
+    let script = "import ctypes, sys\n\
+         libc = ctypes.CDLL('libc.so.6', use_errno=True)\n\
+         fd = libc.open(b'/dev/null', 0)\n\
+         if fd == -1:\n\
+         \x20   sys.exit(2)\n\
+         rc = libc.ioctl(fd, 0x5413, 0)\n\
+         libc.close(fd)\n\
+         if rc == -1:\n\
+         \x20   sys.exit(ctypes.get_errno())\n\
+         sys.exit(1)\n";
+    let cfg = SandboxConfig {
+        argv: vec!["/usr/bin/python3".into(), "-c".into(), script.into()],
+        rootfs: minimal_linux_rootfs(),
+        workdir: Some(PathBuf::from("/work")),
+        ..Default::default()
+    };
+    let outcome = sandbox.run(cfg).await.unwrap();
+    assert_eq!(
+        outcome.exit_status,
+        ExitStatus::Exited(EPERM),
+        "ioctl(TIOCGWINSZ) should EPERM under seccomp; stderr={}",
+        String::from_utf8_lossy(&outcome.stderr)
+    );
+}
+
+/// EV — ioctl(TIOCSTI) blocked by seccomp argument filter.
+#[tokio::test]
+async fn ev_ioctl_tiocsti_blocked() {
+    skip_if_unsupported!();
+    let sandbox = Sandbox::new(runner_path());
+    // TIOCSTI = 0x5412 — simulate terminal input; dangerous
+    let script = "import ctypes, sys\n\
+         libc = ctypes.CDLL('libc.so.6', use_errno=True)\n\
+         # open /dev/null — a harmless fd for testing the ioctl call
+         fd = libc.open(b'/dev/null', 0)\n\
+         if fd == -1:\n\
+         \x20   sys.exit(2)\n\
+         rc = libc.ioctl(fd, 0x5412, 0)\n\
+         libc.close(fd)\n\
+         if rc == -1:\n\
+         \x20   sys.exit(ctypes.get_errno())\n\
+         sys.exit(1)\n";
+    let cfg = SandboxConfig {
+        argv: vec!["/usr/bin/python3".into(), "-c".into(), script.into()],
+        rootfs: minimal_linux_rootfs(),
+        workdir: Some(PathBuf::from("/work")),
+        ..Default::default()
+    };
+    let outcome = sandbox.run(cfg).await.unwrap();
+    assert_eq!(
+        outcome.exit_status,
+        ExitStatus::Exited(EPERM),
+        "ioctl(TIOCSTI) should EPERM under seccomp; stderr={}",
+        String::from_utf8_lossy(&outcome.stderr)
+    );
+}
+
+/// EV — ioctl(TIOCSWINSZ) blocked by seccomp argument filter.
+#[tokio::test]
+async fn ev_ioctl_tiocswinsz_blocked() {
+    skip_if_unsupported!();
+    let sandbox = Sandbox::new(runner_path());
+    // TIOCSWINSZ = 0x5414 — set terminal window size
+    let script = "import ctypes, sys\n\
+         libc = ctypes.CDLL('libc.so.6', use_errno=True)\n\
+         fd = libc.open(b'/dev/null', 0)\n\
+         if fd == -1:\n\
+         \x20   sys.exit(2)\n\
+         rc = libc.ioctl(fd, 0x5414, 0)\n\
+         libc.close(fd)\n\
+         if rc == -1:\n\
+         \x20   sys.exit(ctypes.get_errno())\n\
+         sys.exit(1)\n";
+    let cfg = SandboxConfig {
+        argv: vec!["/usr/bin/python3".into(), "-c".into(), script.into()],
+        rootfs: minimal_linux_rootfs(),
+        workdir: Some(PathBuf::from("/work")),
+        ..Default::default()
+    };
+    let outcome = sandbox.run(cfg).await.unwrap();
+    assert_eq!(
+        outcome.exit_status,
+        ExitStatus::Exited(EPERM),
+        "ioctl(TIOCSWINSZ) should EPERM under seccomp; stderr={}",
+        String::from_utf8_lossy(&outcome.stderr)
+    );
+}
+
+/// EV — ioctl(TIOCSPTLCK) blocked by seccomp argument filter.
+#[tokio::test]
+async fn ev_ioctl_tiocptlck_blocked() {
+    skip_if_unsupported!();
+    let sandbox = Sandbox::new(runner_path());
+    // TIOCSPTLCK = 0x4D60 — unlock pseudo-terminal device lock
+    let script = "import ctypes, sys\n\
+         libc = ctypes.CDLL('libc.so.6', use_errno=True)\n\
+         fd = libc.open(b'/dev/null', 0)\n\
+         if fd == -1:\n\
+         \x20   sys.exit(2)\n\
+         rc = libc.ioctl(fd, 0x4D60, 0)\n\
+         libc.close(fd)\n\
+         if rc == -1:\n\
+         \x20   sys.exit(ctypes.get_errno())\n\
+         sys.exit(1)\n";
+    let cfg = SandboxConfig {
+        argv: vec!["/usr/bin/python3".into(), "-c".into(), script.into()],
+        rootfs: minimal_linux_rootfs(),
+        workdir: Some(PathBuf::from("/work")),
+        ..Default::default()
+    };
+    let outcome = sandbox.run(cfg).await.unwrap();
+    assert_eq!(
+        outcome.exit_status,
+        ExitStatus::Exited(EPERM),
+        "ioctl(TIOCSPTLCK) should EPERM under seccomp; stderr={}",
+        String::from_utf8_lossy(&outcome.stderr)
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[tokio::test]
 async fn ev09_rdtsc_blocked() {
-    // Body intentionally empty — re-enable once PR_SET_TSC is wired.
+    skip_if_unsupported!();
+    let sandbox = Sandbox::new(runner_path());
+    // rdtsc instruction → SIGSEGV (signal 11, exit code 139 = 128 + 11)
+    // when PR_TSC_SIGSEGV is active.
+    let cfg = SandboxConfig {
+        argv: vec![
+            "/usr/bin/python3".into(),
+            "-c".into(),
+            "import mmap, ctypes, struct; \
+             code = mmap.mmap(-1, 4096, prot=7, flags=34); \
+             code.write(struct.pack('15B', 0x0f, 0x01, 0xf9, 0xc3)); \
+             func = ctypes.CFUNCTYPE(ctypes.c_ulong)(ctypes.addressof(code)); \
+             func()"
+                .into(),
+        ],
+        rootfs: minimal_linux_rootfs(),
+        workdir: Some(PathBuf::from("/work")),
+        ..Default::default()
+    };
+    let outcome = sandbox.run(cfg).await.unwrap();
+    // SIGSEGV = signal 11, exit code = 128 + 11 = 139
+    assert!(
+        outcome.exit_status.signaled() && outcome.exit_status.code() == Some(139),
+        "rdtsc should cause SIGSEGV (exit 139); got {:?}",
+        outcome.exit_status
+    );
 }
 
 #[tokio::test]

@@ -1,0 +1,734 @@
+//! Durable Raft log and hard state on redb (ADR 0013 D1).
+//!
+//! One `raft.redb` file per node holds two tables:
+//!
+//! ```text
+//! ├─ "log":  u64  → &[u8]   // protobuf-encoded LogEntry, keyed by 1-based index
+//! └─ "meta": &str → &[u8]   // hard state: current_term, voted_for
+//!                           // snapshot: last index/term + opaque blob (I6)
+//! ```
+//!
+//! Log entries are stored in the same protobuf encoding they take on the wire,
+//! so a leader replicates stored bytes without re-encoding.
+//!
+//! Every mutating method commits its redb transaction before returning — the
+//! **persist-before-respond** rule (`docs/raft-notes.md` §3). Hard state
+//! (`currentTerm` + `votedFor`) is written atomically as a unit via
+//! [`RaftLog::save_hard_state`] so a crash can never expose a torn vote. The
+//! crash-consistency tests below (uncommitted writes are invisible; committed
+//! state survives a real process abort in `tests/crash_consistency.rs`) prove
+//! this. Wiring these primitives into the node's reply path is milestone I3.
+
+use std::path::Path;
+
+use bytes::Bytes;
+use prost::Message;
+use redb::{Database, ReadableTable, TableDefinition};
+
+use brokkr_proto::brokkr::v1 as pb;
+
+use crate::error::RaftError;
+use crate::state::HardState;
+use crate::types::{ClusterConfig, LogEntry, LogIndex, NodeId, SnapshotMeta, Term};
+
+/// Log table: 1-based index → protobuf-encoded [`LogEntry`].
+const LOG_TABLE: TableDefinition<'static, u64, &[u8]> = TableDefinition::new("log");
+/// Hard-state table: string key → raw value bytes.
+const META_TABLE: TableDefinition<'static, &str, &[u8]> = TableDefinition::new("meta");
+
+/// `meta` key for the persisted `currentTerm` (little-endian `u64`).
+const META_CURRENT_TERM: &str = "current_term";
+/// `meta` key for the persisted `votedFor` (UTF-8 node id; absent = none).
+const META_VOTED_FOR: &str = "voted_for";
+/// `meta` key for the snapshot's `last_included_index` (little-endian `u64`).
+const META_SNAP_INDEX: &str = "snapshot_last_index";
+/// `meta` key for the snapshot's `last_included_term` (little-endian `u64`).
+const META_SNAP_TERM: &str = "snapshot_last_term";
+/// `meta` key for the opaque snapshot blob.
+const META_SNAP_DATA: &str = "snapshot_data";
+/// `meta` key for the snapshot's cluster configuration (protobuf-encoded
+/// `brokkr.v1.ClusterConfig`; absent on pre-I7b stores).
+const META_SNAP_CONFIG: &str = "snapshot_config";
+
+/// Maps any `Display` storage error into [`RaftError::Storage`].
+fn stor<E: std::fmt::Display>(e: E) -> RaftError {
+    RaftError::Storage(e.to_string())
+}
+
+/// The durable Raft log and hard state for a single node.
+///
+/// redb handles its own internal locking, so all methods take `&self` and may be
+/// called concurrently.
+#[derive(Debug)]
+pub struct RaftLog {
+    db: Database,
+}
+
+impl RaftLog {
+    /// Opens (creating if absent) the Raft store at `path` and ensures both
+    /// tables exist.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, RaftError> {
+        let db = Database::create(path).map_err(stor)?;
+        let write = db.begin_write().map_err(stor)?;
+        {
+            // Opening a table in a write txn creates it if absent.
+            write.open_table(LOG_TABLE).map_err(stor)?;
+            write.open_table(META_TABLE).map_err(stor)?;
+        }
+        write.commit().map_err(stor)?;
+        Ok(RaftLog { db })
+    }
+
+    /// Appends (or overwrites) a single entry at its index, committing durably.
+    pub fn append(&self, entry: &LogEntry) -> Result<(), RaftError> {
+        self.append_all(std::slice::from_ref(entry))
+    }
+
+    /// Appends (or overwrites) a batch of entries in a single durable
+    /// transaction.
+    pub fn append_all(&self, entries: &[LogEntry]) -> Result<(), RaftError> {
+        let write = self.db.begin_write().map_err(stor)?;
+        {
+            let mut table = write.open_table(LOG_TABLE).map_err(stor)?;
+            for entry in entries {
+                table
+                    .insert(entry.index.get(), entry.encode().as_ref())
+                    .map_err(stor)?;
+            }
+        }
+        write.commit().map_err(stor)?;
+        Ok(())
+    }
+
+    /// Returns the entry at `index`, or `None` if absent.
+    pub fn get(&self, index: LogIndex) -> Result<Option<LogEntry>, RaftError> {
+        let read = self.db.begin_read().map_err(stor)?;
+        let table = read.open_table(LOG_TABLE).map_err(stor)?;
+        match table.get(index.get()).map_err(stor)? {
+            Some(guard) => Ok(Some(LogEntry::decode(guard.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Returns every entry with index `>= from`, in ascending order — the batch a
+    /// leader replicates to a follower starting at its `nextIndex`
+    /// (`docs/raft-notes.md` §5.3).
+    pub fn entries_from(&self, from: LogIndex) -> Result<Vec<LogEntry>, RaftError> {
+        let read = self.db.begin_read().map_err(stor)?;
+        let table = read.open_table(LOG_TABLE).map_err(stor)?;
+        let mut entries = Vec::new();
+        for item in table.range(from.get()..).map_err(stor)? {
+            let (_key, value) = item.map_err(stor)?;
+            entries.push(LogEntry::decode(value.value())?);
+        }
+        Ok(entries)
+    }
+
+    /// The highest index present — the last log entry's, or, when the log is
+    /// empty (fresh store, or fully compacted into a snapshot), the snapshot's
+    /// `last_included_index` ([`LogIndex::ZERO`] if neither exists).
+    pub fn last_index(&self) -> Result<LogIndex, RaftError> {
+        Ok(self.last_index_and_term()?.0)
+    }
+
+    /// The term at [`RaftLog::last_index`], or [`Term::ZERO`] for an empty
+    /// store. Used by the election restriction (`docs/raft-notes.md` §6).
+    pub fn last_term(&self) -> Result<Term, RaftError> {
+        Ok(self.last_index_and_term()?.1)
+    }
+
+    /// The last `(index, term)` — from the log's last entry, falling back to
+    /// the snapshot metadata when the log is empty — in a **single** read
+    /// transaction. Hot paths (heartbeats, `RequestVote`, replication) need
+    /// both together, and the fallback keeps elections correct after the whole
+    /// log has been compacted into a snapshot.
+    pub fn last_index_and_term(&self) -> Result<(LogIndex, Term), RaftError> {
+        let read = self.db.begin_read().map_err(stor)?;
+        let table = read.open_table(LOG_TABLE).map_err(stor)?;
+        let last = table.last().map_err(stor)?;
+        let result = match last {
+            Some((key, value)) => (
+                LogIndex::new(key.value()),
+                LogEntry::decode(value.value())?.term,
+            ),
+            None => {
+                let meta = read.open_table(META_TABLE).map_err(stor)?;
+                match Self::read_snapshot_meta(&meta)? {
+                    Some(snap) => (snap.last_included_index, snap.last_included_term),
+                    None => (LogIndex::ZERO, Term::ZERO),
+                }
+            }
+        };
+        Ok(result)
+    }
+
+    /// The lowest index the log still holds, or [`LogIndex::ZERO`] for an empty
+    /// log. After compaction this is `snapshot.last_included_index + 1`.
+    pub fn first_index(&self) -> Result<LogIndex, RaftError> {
+        let read = self.db.begin_read().map_err(stor)?;
+        let table = read.open_table(LOG_TABLE).map_err(stor)?;
+        let first = table.first().map_err(stor)?;
+        let index = match first {
+            Some((key, _)) => LogIndex::new(key.value()),
+            None => LogIndex::ZERO,
+        };
+        Ok(index)
+    }
+
+    /// Removes every entry with index `>= from` (conflict truncation,
+    /// `docs/raft-notes.md` §5.1 step 3). Truncation only ever happens on
+    /// followers; a leader never deletes its own entries.
+    pub fn truncate_from(&self, from: LogIndex) -> Result<(), RaftError> {
+        let write = self.db.begin_write().map_err(stor)?;
+        {
+            let mut table = write.open_table(LOG_TABLE).map_err(stor)?;
+            let mut to_remove = Vec::new();
+            for item in table.range(from.get()..).map_err(stor)? {
+                let (key, _value) = item.map_err(stor)?;
+                to_remove.push(key.value());
+            }
+            for key in to_remove {
+                table.remove(key).map_err(stor)?;
+            }
+        }
+        write.commit().map_err(stor)?;
+        Ok(())
+    }
+
+    /// Atomically installs a snapshot (metadata + opaque blob) and drops every
+    /// log entry it covers (`index <= meta.last_included_index`), retaining any
+    /// tail beyond it — all in **one** durable transaction, so a crash can
+    /// never leave the prefix dropped without the snapshot or vice versa
+    /// (`docs/plan.md` §17 task 4). Used both for self-compaction and for an
+    /// inbound `InstallSnapshot` whose last-included entry matches our log
+    /// (Raft §7: "retain log entries following it").
+    pub fn compact_to(&self, meta: SnapshotMeta, data: &[u8]) -> Result<(), RaftError> {
+        self.write_snapshot(meta, data, false)
+    }
+
+    /// Atomically installs a snapshot and discards the **entire** log — the
+    /// receiver path when our log conflicts with (or predates) the snapshot's
+    /// last-included entry (Raft §7: "discard the entire log").
+    pub fn install_snapshot_replacing_log(
+        &self,
+        meta: SnapshotMeta,
+        data: &[u8],
+    ) -> Result<(), RaftError> {
+        self.write_snapshot(meta, data, true)
+    }
+
+    fn write_snapshot(
+        &self,
+        meta: SnapshotMeta,
+        data: &[u8],
+        wipe_entire_log: bool,
+    ) -> Result<(), RaftError> {
+        let index_bytes = meta.last_included_index.get().to_le_bytes();
+        let term_bytes = meta.last_included_term.get().to_le_bytes();
+        let config_bytes = pb::ClusterConfig::from(&meta.config).encode_to_vec();
+        let write = self.db.begin_write().map_err(stor)?;
+        {
+            let mut meta_table = write.open_table(META_TABLE).map_err(stor)?;
+            meta_table
+                .insert(META_SNAP_INDEX, &index_bytes[..])
+                .map_err(stor)?;
+            meta_table
+                .insert(META_SNAP_TERM, &term_bytes[..])
+                .map_err(stor)?;
+            meta_table.insert(META_SNAP_DATA, data).map_err(stor)?;
+            meta_table
+                .insert(META_SNAP_CONFIG, &config_bytes[..])
+                .map_err(stor)?;
+
+            let mut log_table = write.open_table(LOG_TABLE).map_err(stor)?;
+            if wipe_entire_log {
+                log_table.retain(|_, _| false).map_err(stor)?;
+            } else {
+                log_table
+                    .retain_in(..=meta.last_included_index.get(), |_, _| false)
+                    .map_err(stor)?;
+            }
+        }
+        write.commit().map_err(stor)?;
+        Ok(())
+    }
+
+    /// The installed snapshot's metadata, or `None` if no snapshot exists.
+    pub fn snapshot_meta(&self) -> Result<Option<SnapshotMeta>, RaftError> {
+        let read = self.db.begin_read().map_err(stor)?;
+        let table = read.open_table(META_TABLE).map_err(stor)?;
+        Self::read_snapshot_meta(&table)
+    }
+
+    /// The installed snapshot (metadata + opaque blob), or `None`.
+    pub fn snapshot(&self) -> Result<Option<(SnapshotMeta, Bytes)>, RaftError> {
+        let read = self.db.begin_read().map_err(stor)?;
+        let table = read.open_table(META_TABLE).map_err(stor)?;
+        let Some(meta) = Self::read_snapshot_meta(&table)? else {
+            return Ok(None);
+        };
+        let data = match table.get(META_SNAP_DATA).map_err(stor)? {
+            Some(guard) => Bytes::copy_from_slice(guard.value()),
+            None => Bytes::new(),
+        };
+        Ok(Some((meta, data)))
+    }
+
+    /// Reads the snapshot metadata within an already-open `meta` table, so
+    /// callers can pair it with other reads in one consistent transaction.
+    fn read_snapshot_meta(
+        table: &impl ReadableTable<&'static str, &'static [u8]>,
+    ) -> Result<Option<SnapshotMeta>, RaftError> {
+        let index = match table.get(META_SNAP_INDEX).map_err(stor)? {
+            Some(guard) => u64_from_le(guard.value())?,
+            None => return Ok(None),
+        };
+        let term = match table.get(META_SNAP_TERM).map_err(stor)? {
+            // Index and term are only ever written together in one
+            // transaction; a lone index would be a corrupted store.
+            Some(guard) => u64_from_le(guard.value())?,
+            None => {
+                return Err(RaftError::Storage(
+                    "snapshot index present without snapshot term".to_string(),
+                ));
+            }
+        };
+        // Absent on pre-I7b stores: decodes to the empty ("unknown") config.
+        let config = match table.get(META_SNAP_CONFIG).map_err(stor)? {
+            Some(guard) => ClusterConfig::try_from(pb::ClusterConfig::decode(guard.value())?)?,
+            None => ClusterConfig::default(),
+        };
+        Ok(Some(SnapshotMeta {
+            last_included_index: LogIndex::new(index),
+            last_included_term: Term::new(term),
+            config,
+        }))
+    }
+
+    /// Atomically persists the hard state (`currentTerm` **and** `votedFor`) in
+    /// a single durable transaction, then returns. Because both fields commit
+    /// together, a crash can never expose a torn `(term, vote)` pair
+    /// (`docs/raft-notes.md` §3, [`HardState`]). This is the core
+    /// persist-before-respond primitive.
+    pub fn save_hard_state(&self, state: &HardState) -> Result<(), RaftError> {
+        let term_bytes = state.current_term.get().to_le_bytes();
+        let write = self.db.begin_write().map_err(stor)?;
+        {
+            let mut table = write.open_table(META_TABLE).map_err(stor)?;
+            table
+                .insert(META_CURRENT_TERM, &term_bytes[..])
+                .map_err(stor)?;
+            match &state.voted_for {
+                Some(id) => {
+                    table
+                        .insert(META_VOTED_FOR, id.as_str().as_bytes())
+                        .map_err(stor)?;
+                }
+                None => {
+                    table.remove(META_VOTED_FOR).map_err(stor)?;
+                }
+            }
+        }
+        write.commit().map_err(stor)?;
+        Ok(())
+    }
+
+    /// Loads the persisted hard state, defaulting to [`HardState::new`] (term 0,
+    /// no vote) on a fresh store.
+    ///
+    /// Both keys are read within a **single** redb read transaction, so the
+    /// returned `(currentTerm, votedFor)` pair is always a consistent committed
+    /// snapshot: a concurrent [`RaftLog::save_hard_state`] can never interleave
+    /// between the two reads to yield a torn pair (e.g. an old term with a new
+    /// vote). Reading them in separate transactions would reintroduce exactly
+    /// the torn-state hazard this atomicity exists to prevent.
+    pub fn load_hard_state(&self) -> Result<HardState, RaftError> {
+        let read = self.db.begin_read().map_err(stor)?;
+        let table = read.open_table(META_TABLE).map_err(stor)?;
+        let current_term = match table.get(META_CURRENT_TERM).map_err(stor)? {
+            Some(guard) => Term::new(u64_from_le(guard.value())?),
+            None => Term::ZERO,
+        };
+        let voted_for = match table.get(META_VOTED_FOR).map_err(stor)? {
+            Some(guard) => {
+                let s = std::str::from_utf8(guard.value()).map_err(stor)?;
+                Some(NodeId::new(s)?)
+            }
+            None => None,
+        };
+        Ok(HardState {
+            current_term,
+            voted_for,
+        })
+    }
+
+    /// Loads `currentTerm`, or [`Term::ZERO`] if never set.
+    pub fn current_term(&self) -> Result<Term, RaftError> {
+        match self.get_meta(META_CURRENT_TERM)? {
+            Some(bytes) => Ok(Term::new(u64_from_le(&bytes)?)),
+            None => Ok(Term::ZERO),
+        }
+    }
+
+    /// Loads `votedFor`, or `None` if this node has not voted in its current
+    /// term.
+    pub fn voted_for(&self) -> Result<Option<NodeId>, RaftError> {
+        match self.get_meta(META_VOTED_FOR)? {
+            Some(bytes) => {
+                let s = String::from_utf8(bytes).map_err(stor)?;
+                Ok(Some(NodeId::new(s)?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>, RaftError> {
+        let read = self.db.begin_read().map_err(stor)?;
+        let table = read.open_table(META_TABLE).map_err(stor)?;
+        match table.get(key).map_err(stor)? {
+            Some(guard) => Ok(Some(guard.value().to_vec())),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Decodes a little-endian `u64` from an 8-byte meta value.
+fn u64_from_le(bytes: &[u8]) -> Result<u64, RaftError> {
+    let arr: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| RaftError::Storage(format!("expected 8-byte u64, got {}", bytes.len())))?;
+    Ok(u64::from_le_bytes(arr))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::disallowed_methods)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    fn temp_log() -> (tempfile::TempDir, RaftLog) {
+        let dir = tempfile::tempdir().unwrap();
+        let log = RaftLog::open(dir.path().join("raft.redb")).unwrap();
+        (dir, log)
+    }
+
+    fn entry(term: u64, index: u64, cmd: &'static [u8]) -> LogEntry {
+        LogEntry::new(
+            Term::new(term),
+            LogIndex::new(index),
+            Bytes::from_static(cmd),
+        )
+    }
+
+    fn hard(term: u64, voted: Option<&str>) -> HardState {
+        HardState {
+            current_term: Term::new(term),
+            voted_for: voted.map(|v| NodeId::new(v).unwrap()),
+        }
+    }
+
+    #[test]
+    fn empty_log_reports_zero() {
+        let (_dir, log) = temp_log();
+        assert_eq!(log.last_index().unwrap(), LogIndex::ZERO);
+        assert_eq!(log.last_term().unwrap(), Term::ZERO);
+        assert_eq!(log.get(LogIndex::new(1)).unwrap(), None);
+    }
+
+    #[test]
+    fn append_then_get_round_trips() {
+        let (_dir, log) = temp_log();
+        let e = entry(1, 1, b"a");
+        log.append(&e).unwrap();
+        assert_eq!(log.get(LogIndex::new(1)).unwrap(), Some(e));
+        assert_eq!(log.last_index().unwrap(), LogIndex::new(1));
+        assert_eq!(log.last_term().unwrap(), Term::new(1));
+    }
+
+    #[test]
+    fn append_all_is_atomic_batch() {
+        let (_dir, log) = temp_log();
+        log.append_all(&[entry(1, 1, b"a"), entry(1, 2, b"b"), entry(2, 3, b"c")])
+            .unwrap();
+        assert_eq!(log.last_index().unwrap(), LogIndex::new(3));
+        assert_eq!(log.last_term().unwrap(), Term::new(2));
+        assert_eq!(
+            log.get(LogIndex::new(2))
+                .unwrap()
+                .unwrap()
+                .command()
+                .cloned(),
+            Some(Bytes::from_static(b"b"))
+        );
+    }
+
+    #[test]
+    fn config_entry_survives_disk_round_trip() {
+        use crate::types::{ClusterConfig, EntryPayload};
+        let (_dir, log) = temp_log();
+        let config = ClusterConfig {
+            voters: ["a", "b", "c"]
+                .iter()
+                .map(|n| NodeId::new(*n).unwrap())
+                .collect(),
+            old_voters: Some(
+                ["a", "b"]
+                    .iter()
+                    .map(|n| NodeId::new(*n).unwrap())
+                    .collect(),
+            ),
+            learners: ["l"].iter().map(|n| NodeId::new(*n).unwrap()).collect(),
+        };
+        let entry =
+            LogEntry::with_payload(Term::new(2), LogIndex::new(1), EntryPayload::Config(config));
+        log.append(&entry).unwrap();
+        assert_eq!(log.get(LogIndex::new(1)).unwrap(), Some(entry));
+    }
+
+    #[test]
+    fn survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raft.redb");
+        {
+            let log = RaftLog::open(&path).unwrap();
+            log.append_all(&[entry(3, 1, b"x"), entry(3, 2, b"y")])
+                .unwrap();
+            log.save_hard_state(&hard(3, Some("node-b"))).unwrap();
+        }
+        let log = RaftLog::open(&path).unwrap();
+        assert_eq!(log.last_index().unwrap(), LogIndex::new(2));
+        assert_eq!(log.load_hard_state().unwrap(), hard(3, Some("node-b")));
+    }
+
+    #[test]
+    fn truncate_from_removes_suffix_only() {
+        let (_dir, log) = temp_log();
+        log.append_all(&[entry(1, 1, b"a"), entry(1, 2, b"b"), entry(1, 3, b"c")])
+            .unwrap();
+        log.truncate_from(LogIndex::new(2)).unwrap();
+        assert_eq!(log.get(LogIndex::new(1)).unwrap(), Some(entry(1, 1, b"a")));
+        assert_eq!(log.get(LogIndex::new(2)).unwrap(), None);
+        assert_eq!(log.get(LogIndex::new(3)).unwrap(), None);
+        assert_eq!(log.last_index().unwrap(), LogIndex::new(1));
+    }
+
+    #[test]
+    fn overwrite_at_index_replaces_entry() {
+        let (_dir, log) = temp_log();
+        log.append(&entry(1, 1, b"old")).unwrap();
+        log.append(&entry(2, 1, b"new")).unwrap();
+        let got = log.get(LogIndex::new(1)).unwrap().unwrap();
+        assert_eq!(got.term, Term::new(2));
+        assert_eq!(got.command().cloned(), Some(Bytes::from_static(b"new")));
+    }
+
+    #[test]
+    fn hard_state_defaults_to_zero_no_vote() {
+        let (_dir, log) = temp_log();
+        assert_eq!(log.load_hard_state().unwrap(), HardState::new());
+        assert_eq!(log.current_term().unwrap(), Term::ZERO);
+        assert_eq!(log.voted_for().unwrap(), None);
+    }
+
+    #[test]
+    fn hard_state_round_trips() {
+        let (_dir, log) = temp_log();
+        log.save_hard_state(&hard(9, Some("candidate-1"))).unwrap();
+        assert_eq!(log.load_hard_state().unwrap(), hard(9, Some("candidate-1")));
+    }
+
+    #[test]
+    fn stepping_to_higher_term_clears_vote_atomically() {
+        let (_dir, log) = temp_log();
+        // Voted for A in term 5.
+        log.save_hard_state(&hard(5, Some("A"))).unwrap();
+        assert_eq!(log.load_hard_state().unwrap(), hard(5, Some("A")));
+
+        // Step to term 6: the vote must be gone, never (6, Some("A")).
+        let stepped = log.load_hard_state().unwrap().stepped_to(Term::new(6));
+        log.save_hard_state(&stepped).unwrap();
+        assert_eq!(log.load_hard_state().unwrap(), hard(6, None));
+    }
+
+    #[test]
+    fn uncommitted_write_is_invisible_after_reopen() {
+        // Persist-before-respond: a write that is never committed (as if the
+        // process crashed before the commit fsync) must leave no trace. Only
+        // committed state is ever observable.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raft.redb");
+        {
+            let log = RaftLog::open(&path).unwrap();
+            log.save_hard_state(&hard(5, Some("A"))).unwrap(); // committed
+
+            // Begin a write that bumps the term to 999, then drop it WITHOUT
+            // committing — redb rolls it back exactly as a crash would.
+            let write = log.db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(META_TABLE).unwrap();
+                let bogus = 999u64.to_le_bytes();
+                table.insert(META_CURRENT_TERM, &bogus[..]).unwrap();
+            }
+            drop(write); // no commit
+
+            // The live handle still sees only the committed state.
+            assert_eq!(log.load_hard_state().unwrap(), hard(5, Some("A")));
+        }
+
+        // Reopen from disk: the uncommitted term 999 never happened.
+        let log = RaftLog::open(&path).unwrap();
+        assert_eq!(log.load_hard_state().unwrap(), hard(5, Some("A")));
+    }
+
+    #[test]
+    fn load_hard_state_reads_a_consistent_pair_under_concurrent_writes() {
+        // Regression test for the torn-read hazard: `load_hard_state` must read
+        // both keys in ONE transaction. The writer only ever commits pairs where
+        // (term is odd) <=> (a vote is recorded). A non-atomic reader (two
+        // separate read transactions) could observe an (odd, None) or
+        // (even, Some) pair that was never committed together; the invariant
+        // below would then fail.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(RaftLog::open(dir.path().join("raft.redb")).unwrap());
+        log.save_hard_state(&hard(0, None)).unwrap();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let log = Arc::clone(&log);
+            let done = Arc::clone(&done);
+            thread::spawn(move || {
+                for term in 1u64..=400 {
+                    let voted = if term % 2 == 1 { Some("n") } else { None };
+                    log.save_hard_state(&hard(term, voted)).unwrap();
+                }
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+
+        // Read continuously for the whole write window (plus a minimum count).
+        let mut reads = 0u32;
+        while !done.load(Ordering::SeqCst) || reads < 200 {
+            let hs = log.load_hard_state().unwrap();
+            let term_is_odd = hs.current_term.get() % 2 == 1;
+            assert_eq!(
+                term_is_odd,
+                hs.voted_for.is_some(),
+                "torn read: term={} voted_for={:?}",
+                hs.current_term.get(),
+                hs.voted_for
+            );
+            reads += 1;
+        }
+        writer.join().unwrap();
+    }
+
+    // --- snapshots (I6) ----------------------------------------------------
+
+    fn meta(index: u64, term: u64) -> SnapshotMeta {
+        SnapshotMeta {
+            last_included_index: LogIndex::new(index),
+            last_included_term: Term::new(term),
+            config: ClusterConfig::default(),
+        }
+    }
+
+    #[test]
+    fn fresh_store_has_no_snapshot() {
+        let (_dir, log) = temp_log();
+        assert_eq!(log.snapshot_meta().unwrap(), None);
+        assert!(log.snapshot().unwrap().is_none());
+        assert_eq!(log.first_index().unwrap(), LogIndex::ZERO);
+    }
+
+    #[test]
+    fn compact_to_drops_covered_prefix_and_keeps_tail() {
+        let (_dir, log) = temp_log();
+        log.append_all(&[
+            entry(1, 1, b"a"),
+            entry(1, 2, b"b"),
+            entry(2, 3, b"c"),
+            entry(2, 4, b"d"),
+            entry(2, 5, b"e"),
+        ])
+        .unwrap();
+        log.compact_to(meta(3, 2), b"blob@3").unwrap();
+
+        assert_eq!(log.get(LogIndex::new(1)).unwrap(), None);
+        assert_eq!(log.get(LogIndex::new(3)).unwrap(), None);
+        assert_eq!(log.get(LogIndex::new(4)).unwrap(), Some(entry(2, 4, b"d")));
+        assert_eq!(log.first_index().unwrap(), LogIndex::new(4));
+        assert_eq!(log.last_index().unwrap(), LogIndex::new(5));
+        let (m, data) = log.snapshot().unwrap().unwrap();
+        assert_eq!(m, meta(3, 2));
+        assert_eq!(data, Bytes::from_static(b"blob@3"));
+    }
+
+    #[test]
+    fn install_snapshot_replacing_log_discards_everything() {
+        let (_dir, log) = temp_log();
+        log.append_all(&[entry(1, 1, b"a"), entry(1, 2, b"b"), entry(1, 3, b"c")])
+            .unwrap();
+        // The incoming snapshot is beyond (and inconsistent with) our log.
+        log.install_snapshot_replacing_log(meta(10, 4), b"blob@10")
+            .unwrap();
+        assert_eq!(log.first_index().unwrap(), LogIndex::ZERO, "log is empty");
+        // last (index, term) falls back to the snapshot metadata.
+        assert_eq!(log.last_index().unwrap(), LogIndex::new(10));
+        assert_eq!(log.last_term().unwrap(), Term::new(4));
+        assert_eq!(
+            log.last_index_and_term().unwrap(),
+            (LogIndex::new(10), Term::new(4))
+        );
+    }
+
+    #[test]
+    fn snapshot_and_dropped_prefix_survive_reopen_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raft.redb");
+        {
+            let log = RaftLog::open(&path).unwrap();
+            log.append_all(&[entry(1, 1, b"a"), entry(1, 2, b"b")])
+                .unwrap();
+            log.compact_to(meta(2, 1), b"snap").unwrap();
+        }
+        let log = RaftLog::open(&path).unwrap();
+        assert_eq!(log.snapshot_meta().unwrap(), Some(meta(2, 1)));
+        assert_eq!(log.first_index().unwrap(), LogIndex::ZERO);
+        assert_eq!(log.last_index().unwrap(), LogIndex::new(2));
+        let (_, data) = log.snapshot().unwrap().unwrap();
+        assert_eq!(data, Bytes::from_static(b"snap"));
+    }
+
+    #[test]
+    fn a_newer_snapshot_overwrites_an_older_one() {
+        let (_dir, log) = temp_log();
+        log.append_all(&[entry(1, 1, b"a"), entry(1, 2, b"b"), entry(1, 3, b"c")])
+            .unwrap();
+        log.compact_to(meta(1, 1), b"v1").unwrap();
+        log.compact_to(meta(3, 1), b"v2").unwrap();
+        let (m, data) = log.snapshot().unwrap().unwrap();
+        assert_eq!(m, meta(3, 1));
+        assert_eq!(data, Bytes::from_static(b"v2"));
+        assert_eq!(log.first_index().unwrap(), LogIndex::ZERO);
+    }
+
+    #[test]
+    fn committed_log_and_hard_state_recover_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raft.redb");
+        {
+            let log = RaftLog::open(&path).unwrap();
+            log.append_all(&[entry(2, 1, b"a"), entry(2, 2, b"b")])
+                .unwrap();
+            log.save_hard_state(&hard(2, Some("leader"))).unwrap();
+        }
+        let log = RaftLog::open(&path).unwrap();
+        assert_eq!(log.last_index().unwrap(), LogIndex::new(2));
+        assert_eq!(log.last_term().unwrap(), Term::new(2));
+        assert_eq!(log.load_hard_state().unwrap(), hard(2, Some("leader")));
+    }
+}
